@@ -238,9 +238,9 @@ details .row{margin-top:10px}
     <h3>Import LoRA <button class="iconbtn" id="closeImport" title="ปิด">×</button></h3>
     <div class="hint">ไฟล์จะถูกเก็บในเครื่อง vast (ComfyUI/models/loras) แล้วเลือกใช้ได้ทันที</div>
 
-    <h4>วางลิงก์ huggingface.co หรือ civitai.com</h4>
+    <h4>วางลิงก์ huggingface.co หรือ civitai (.com / .red)</h4>
     <div class="urlrow"><input type="text" id="impUrl" placeholder="https://civitai.com/models/12345  หรือ  https://huggingface.co/…/xxx.safetensors"><button class="btn" id="impGo">ดาวน์โหลด</button></div>
-    <div class="hint" style="margin-top:6px">• Civitai: ใช้ลิงก์หน้าโมเดลได้เลย (ถ้าเลือกเวอร์ชันไว้ จะโหลดเวอร์ชันนั้น)<br>• HuggingFace: เปิดหน้าไฟล์ .safetensors แล้วก๊อปลิงก์</div>
+    <div class="hint" style="margin-top:6px">• Civitai: ใช้ลิงก์หน้าโมเดลได้เลย ทั้ง civitai.com และ civitai.red (ถ้าเลือกเวอร์ชันไว้ จะโหลดเวอร์ชันนั้น)<br>• HuggingFace: เปิดหน้าไฟล์ .safetensors แล้วก๊อปลิงก์</div>
 
     <h4>หรืออัปโหลดไฟล์จากเครื่องคุณ</h4>
     <label class="drop" id="drop"><input type="file" id="impFile" accept=".safetensors" multiple hidden>
@@ -705,7 +705,7 @@ loadGallery().then(last => { if (last.length) show(last[0].im, last[0].im.filena
 '''
 
 ROUTES = PromptServer.instance.routes
-ALLOWED_HOSTS = ("huggingface.co", "civitai.com")
+ALLOWED_HOSTS = ("huggingface.co", "civitai.com", "civitai.red", "civitai.green")
 JOBS = {}          # งานดาวน์โหลด LoRA จากลิงก์
 UA = {"User-Agent": "MagMix-Studio/1.0"}
 
@@ -744,7 +744,7 @@ async def _resolve(url, session, civitai_key):
     """แปลงลิงก์ที่ผู้ใช้วาง → (ลิงก์ดาวน์โหลดจริง, headers, ชื่อไฟล์ที่เดาได้)"""
     u = urllib.parse.urlparse(url.strip())
     if u.scheme != "https" or not _host_ok(u.hostname):
-        raise ValueError("รองรับเฉพาะลิงก์ https จาก huggingface.co หรือ civitai.com")
+        raise ValueError("รองรับเฉพาะลิงก์ https จาก huggingface.co หรือ civitai (.com / .red / .green)")
     host = u.hostname.lower()
     if host.endswith("huggingface.co"):
         path = u.path.replace("/blob/", "/resolve/", 1)
@@ -752,7 +752,8 @@ async def _resolve(url, session, civitai_key):
             raise ValueError("ลิงก์ HuggingFace ต้องเป็นลิงก์ของไฟล์ .safetensors "
                              "(เปิดหน้าไฟล์แล้วก๊อปลิงก์ ไม่ใช่หน้าแรกของ repo)")
         return urllib.parse.urlunparse(("https", "huggingface.co", path, "", "", "")), {}, os.path.basename(path)
-    # ---- civitai ----
+    # ---- civitai (civitai.com / civitai.red / civitai.green ใช้ระบบเดียวกัน) ----
+    cbase = "https://civitai.red" if host.endswith("civitai.red") else "https://civitai.com"
     q = urllib.parse.parse_qs(u.query)
     m = re.search(r"/api/download/models/(\d+)", u.path)
     if m:
@@ -766,7 +767,7 @@ async def _resolve(url, session, civitai_key):
             h = dict(UA)
             if civitai_key:
                 h["Authorization"] = "Bearer " + civitai_key
-            async with session.get("https://civitai.com/api/v1/models/" + m.group(1), headers=h) as r:
+            async with session.get(cbase + "/api/v1/models/" + m.group(1), headers=h) as r:
                 if r.status != 200:
                     raise ValueError("อ่านข้อมูลโมเดลจาก Civitai ไม่ได้ (HTTP %d)" % r.status)
                 j = await r.json()
@@ -777,7 +778,7 @@ async def _resolve(url, session, civitai_key):
     headers = {}
     if civitai_key:
         headers["Authorization"] = "Bearer " + civitai_key
-    return "https://civitai.com/api/download/models/%s?type=Model&format=SafeTensor" % vid, headers, None
+    return cbase + "/api/download/models/%s?type=Model&format=SafeTensor" % vid, headers, None
 
 
 async def _run_job(jid, url, civitai_key, hf_token):
@@ -848,7 +849,7 @@ async def _lora_url(request):
         return web.json_response({"error": "ยังไม่ได้ใส่ลิงก์"}, status=400)
     u = urllib.parse.urlparse(url)
     if u.scheme != "https" or not _host_ok(u.hostname):
-        return web.json_response({"error": "รองรับเฉพาะลิงก์ https จาก huggingface.co หรือ civitai.com"}, status=400)
+        return web.json_response({"error": "รองรับเฉพาะลิงก์ https จาก huggingface.co หรือ civitai (.com / .red / .green)"}, status=400)
     jid = uuid.uuid4().hex[:12]
     JOBS[jid] = {"id": jid, "url": url, "name": "", "status": "running", "done": 0, "total": 0,
                  "error": "", "note": "", "t": time.time()}
