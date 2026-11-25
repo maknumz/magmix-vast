@@ -1,0 +1,555 @@
+#!/bin/bash
+# =====================================================================
+#  MagMix — Krea 2 + LoRA + หน้าแอป MagMix Studio สำหรับ vast.ai
+#  ใช้กับเทมเพลท ComfyUI ทางการของ vast (image: vastai/comfyui)
+#  vast จะรันสคริปต์นี้ให้เองตอนเปิดเครื่องครั้งแรก (ตัวแปร PROVISIONING_SCRIPT)
+#  ไม่ต้องใช้ HF token — ไฟล์ทั้งหมดเป็น public
+# =====================================================================
+set -uo pipefail
+
+COMFY="${WORKSPACE:-/workspace}/ComfyUI"
+M="$COMFY/models"
+mkdir -p "$M/diffusion_models" "$M/text_encoders" "$M/vae" "$M/loras" "$COMFY/custom_nodes"
+
+FAILED=0
+dl() {  # dl <url> <ไฟล์ปลายทาง>
+  local url="$1" dest="$2" name
+  name="$(basename "$dest")"
+  if [ -s "$dest" ]; then echo "✓ มีแล้ว: $name"; return 0; fi
+  echo "⬇ กำลังโหลด: $name"
+  for i in 1 2 3 4 5; do
+    if curl -fL --retry 3 --retry-delay 5 -C - -o "$dest.part" "$url"; then
+      mv "$dest.part" "$dest"; echo "✓ เสร็จ: $name"; return 0
+    fi
+    echo "  โหลดสะดุด ลองใหม่ครั้งที่ $i ..."; sleep 5
+  done
+  echo "✗ โหลดไม่สำเร็จ: $name ($url)"; return 1
+}
+
+# ---------- โมเดล Krea 2 Turbo (Comfy-Org) ----------
+K="https://huggingface.co/Comfy-Org/Krea-2/resolve/main"
+dl "$K/diffusion_models/krea2_turbo_fp8_scaled.safetensors" "$M/diffusion_models/krea2_turbo_fp8_scaled.safetensors" & P1=$!
+dl "$K/text_encoders/qwen3vl_4b_fp8_scaled.safetensors"     "$M/text_encoders/qwen3vl_4b_fp8_scaled.safetensors"     & P2=$!
+dl "$K/vae/qwen_image_vae.safetensors"                       "$M/vae/qwen_image_vae.safetensors"                       & P3=$!
+
+# ---------- LoRA ของ MagMix ----------
+L="https://huggingface.co/Khanes"
+dl "$L/kreansfw/resolve/main/NSFW.safetensors" "$M/loras/NSFW.safetensors" & P4=$!
+dl "$L/kreapro/resolve/main/Pro.safetensors"   "$M/loras/Pro.safetensors"  & P5=$!
+dl "$L/90s/resolve/main/90s.safetensors"       "$M/loras/90s.safetensors"  & P6=$!
+dl "$L/Krea2Film/resolve/main/FILM.safetensors" "$M/loras/FILM.safetensors" & P7=$!
+
+for p in $P1 $P2 $P3 $P4 $P5 $P6 $P7; do wait "$p" || FAILED=1; done
+
+# ---------- หน้าแอป MagMix Studio (เปิดที่ /magmix) ----------
+cat > "$COMFY/custom_nodes/magmix_studio.py" <<'MAGMIX_PLUGIN_EOF'
+"""MagMix Studio — หน้าแอปครอบ ComfyUI สำหรับ Krea 2
+วางไฟล์นี้ใน ComfyUI/custom_nodes/ แล้วรีสตาร์ต ComfyUI
+เปิดใช้: http(s)://<ที่อยู่ ComfyUI>/magmix
+"""
+from aiohttp import web
+from server import PromptServer
+
+HTML = r'''<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MagMix Studio</title>
+<style>
+:root{
+  --bg:#0d0e11; --card:#15161a; --card2:#1c1d22; --line:#2a2b31; --text:#e7e7ea; --muted:#9a9ba3;
+  --accent:#e2533c; --accent2:#ff6b52; --knob:#d9dade; --ok:#4cc38a; --err:#ff5d5d;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans Thai",Roboto,sans-serif;font-size:14px}
+.app{display:grid;grid-template-columns:340px minmax(0,1fr) 380px;gap:14px;height:100vh;padding:14px}
+.col{min-height:0;overflow:auto;display:flex;flex-direction:column;gap:12px;padding-right:2px}
+.col::-webkit-scrollbar{width:6px}.col::-webkit-scrollbar-thumb{background:#2c2d33;border-radius:3px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}
+.card h3{margin:0 0 12px;font-size:17px;font-weight:700;display:flex;align-items:center;justify-content:space-between}
+.brand{font-size:18px;font-weight:800;letter-spacing:.3px;padding:4px 4px 0}
+.brand small{display:block;font-weight:500;color:var(--muted);font-size:12px;margin-top:2px}
+select,textarea,input[type=number]{width:100%;background:var(--card2);color:var(--text);border:1px solid var(--line);
+  border-radius:10px;padding:11px 12px;font-size:15px;font-family:inherit;outline:none}
+select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);
+  background-position:calc(100% - 18px) 50%,calc(100% - 13px) 50%;background-size:5px 5px;background-repeat:no-repeat;padding-right:34px}
+select:focus,textarea:focus,input:focus{border-color:#4a4b53}
+.row{display:flex;align-items:center;justify-content:space-between;color:var(--muted);margin:14px 0 6px;font-size:14px}
+.row b{color:var(--text);font-weight:600}
+/* ---------- slider ---------- */
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:22px;background:transparent;margin:0;cursor:pointer;--p:50%}
+input[type=range]::-webkit-slider-runnable-track{height:6px;border-radius:3px;background:linear-gradient(90deg,var(--accent) var(--p),#2e2f35 var(--p))}
+input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:linear-gradient(90deg,var(--accent) var(--p),#2e2f35 var(--p))}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;background:var(--knob);margin-top:-8px;
+  box-shadow:0 1px 4px rgba(0,0,0,.6);border:2px solid #f4f4f6}
+input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:var(--knob);border:2px solid #f4f4f6}
+/* ---------- aspect chips ---------- */
+.aspects{display:flex;gap:6px;overflow-x:auto;padding:12px 2px 6px;scrollbar-width:none}
+.aspects::-webkit-scrollbar{display:none}
+.chip{flex:0 0 auto;width:64px;border-radius:12px;padding:8px 4px 6px;display:flex;flex-direction:column;align-items:center;gap:6px;
+  cursor:pointer;color:var(--muted);user-select:none;border:1px solid transparent}
+.chip .box{border:1.5px solid #6f7078;border-radius:3px}
+.chip span{font-size:14px}
+.chip.on{background:var(--card2);color:var(--text);border-color:#33343a}
+.chip.on .box{border-color:#fff;border-width:2px}
+.seg{display:flex;background:var(--card2);border-radius:12px;padding:3px;margin-top:6px}
+.seg button{flex:1;background:transparent;border:0;color:var(--muted);font-size:15px;padding:9px 0;border-radius:9px;cursor:pointer;font-family:inherit}
+.seg button.on{background:#2a2b31;color:var(--text);font-weight:600}
+/* ---------- lora ---------- */
+.lora{border-top:1px solid var(--line);padding-top:14px;margin-top:14px}
+.lora:first-of-type{border-top:0;margin-top:0;padding-top:0}
+.lora-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;font-size:17px;font-weight:700}
+.iconbtn{width:40px;height:40px;border-radius:10px;background:var(--card2);border:1px solid var(--line);color:var(--text);
+  font-size:22px;line-height:1;cursor:pointer;display:grid;place-items:center}
+.iconbtn:hover{border-color:#4a4b53}
+.muted{color:var(--muted)}
+.check{display:flex;align-items:center;gap:8px;color:var(--muted);margin-top:8px;cursor:pointer;user-select:none}
+.seedrow{display:flex;gap:8px}.seedrow input{flex:1}
+/* ---------- center ---------- */
+textarea{min-height:150px;resize:vertical;line-height:1.5}
+.gen{width:100%;margin-top:12px;background:var(--accent);border:0;color:#fff;font-size:17px;font-weight:700;padding:14px;border-radius:12px;cursor:pointer}
+.gen:hover{background:var(--accent2)}.gen:disabled{opacity:.55;cursor:wait}
+.bar{height:6px;background:#2a2b31;border-radius:3px;overflow:hidden;margin-top:12px}
+.bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
+.status{margin-top:8px;color:var(--muted);font-size:13px;min-height:18px;white-space:pre-wrap}
+.status.err{color:var(--err)}
+.stage{flex:1;min-height:420px;display:flex;align-items:center;justify-content:center;background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden;position:relative}
+.stage img{width:100%;height:100%;object-fit:contain;display:block}
+.stage img.preview{opacity:.75;filter:saturate(.8)}
+.stage .empty{color:var(--muted);text-align:center;padding:30px;line-height:1.7}
+.stage .tools{position:absolute;right:10px;top:10px;display:flex;gap:6px}
+.stage .tools a{background:rgba(0,0,0,.55);color:#fff;text-decoration:none;padding:7px 11px;border-radius:9px;font-size:13px}
+.meta{color:var(--muted);font-size:12px;text-align:center}
+/* ---------- gallery ---------- */
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.grid .cell{aspect-ratio:3/4;border-radius:10px;overflow:hidden;background:var(--card2);cursor:pointer;border:2px solid transparent}
+.grid .cell.on{border-color:var(--accent)}
+.grid img{width:100%;height:100%;object-fit:cover;display:block}
+.grid .ph{aspect-ratio:3/4;border-radius:10px;background:var(--card2);opacity:.45}
+.banner{background:#3a1d1d;border:1px solid #6b2b2b;color:#ffb4b4;border-radius:12px;padding:10px 12px;font-size:13px;display:none}
+@media (max-width:1100px){.app{grid-template-columns:1fr;height:auto}.col{overflow:visible}.stage{min-height:360px}}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- ================= Column 1 : settings ================= -->
+  <div class="col" id="c1">
+    <div class="brand">MagMix Studio<small>Krea 2 · ComfyUI</small></div>
+    <div class="banner" id="banner"></div>
+
+    <div class="card">
+      <h3>Image Size <span class="muted" title="เลือกสัดส่วน แล้วเลือก Small / Normal / Large หรือลากปรับกว้าง-สูงเองได้">ⓘ</span></h3>
+      <select id="preset"></select>
+      <div class="aspects" id="aspects"></div>
+      <div class="seg" id="tiers"></div>
+      <div class="row"><span>Width</span><b id="wv"></b></div>
+      <input type="range" id="w" min="512" max="2048" step="16">
+      <div class="row"><span>Height</span><b id="hv"></b></div>
+      <input type="range" id="h" min="512" max="2048" step="16">
+    </div>
+
+    <div class="card" id="loraCard"></div>
+
+    <div class="card">
+      <h3>Sampler</h3>
+      <div class="row" style="margin-top:0"><span>Steps</span><b id="stv"></b></div>
+      <input type="range" id="steps" min="1" max="50" step="1">
+      <div class="row"><span>CFG</span><b id="cfv"></b></div>
+      <input type="range" id="cfg" min="1" max="10" step="0.1">
+      <div class="row"><span>Sampler</span></div>
+      <select id="sampler"></select>
+      <div class="row"><span>Scheduler</span></div>
+      <select id="scheduler"></select>
+      <div class="row"><span>Seed</span></div>
+      <div class="seedrow"><input type="number" id="seed" min="0"><button class="iconbtn" id="dice" title="สุ่ม seed">🎲</button></div>
+      <label class="check"><input type="checkbox" id="rand"> สุ่ม seed ใหม่ทุกครั้งที่กดสร้าง</label>
+    </div>
+
+    <div class="card">
+      <h3>Models</h3>
+      <div class="row" style="margin-top:0"><span>Diffusion model</span></div>
+      <select id="unet"></select>
+      <div class="row"><span>Text encoder</span></div>
+      <select id="clip"></select>
+      <div class="row"><span>VAE</span></div>
+      <select id="vae"></select>
+    </div>
+  </div>
+
+  <!-- ================= Column 2 : prompt + image ================= -->
+  <div class="col" id="c2">
+    <div class="card">
+      <h3>Prompt</h3>
+      <textarea id="prompt" placeholder="พิมพ์สิ่งที่อยากได้ เช่น a young Thai woman, long hair, soft smile, cozy room, night vibe"></textarea>
+      <button class="gen" id="go">✨ สร้างภาพ</button>
+      <div class="bar"><i id="bar"></i></div>
+      <div class="status" id="status"></div>
+    </div>
+    <div class="stage" id="stage"><div class="empty">ภาพที่สร้างจะแสดงตรงนี้<br><span style="font-size:12px">กด ✨ สร้างภาพ หรือ Ctrl/⌘ + Enter</span></div></div>
+    <div class="meta" id="meta"></div>
+  </div>
+
+  <!-- ================= Column 3 : gallery ================= -->
+  <div class="col" id="c3">
+    <div class="card">
+      <h3>ภาพล่าสุด <span class="muted" style="font-size:13px;font-weight:500" id="gcount"></span></h3>
+      <div class="grid" id="grid"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+"use strict";
+const API = location.origin + "/api";
+const $ = (id) => document.getElementById(id);
+const CLIENT_ID = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2));
+const MAX_LORA = 6;
+
+// ---------- size presets (Normal ≈ 1.5 MP, ปัดเป็นทวีคูณ 16) ----------
+const ASPECTS = [
+  ["21:9", 1904, 816], ["16:9", 1648, 928], ["3:2", 1536, 1024], ["4:3", 1408, 1088], ["5:4", 1376, 1104],
+  ["1:1", 1216, 1216], ["4:5", 1104, 1376], ["3:4", 1088, 1408], ["2:3", 1024, 1536], ["9:16", 928, 1648]
+];
+const TIERS = [["Small", 0.75], ["Normal", 1], ["Large", 1.25]];
+const r16 = (v) => Math.max(512, Math.min(2048, Math.round(v / 16) * 16));
+const dims = (a, t) => {
+  const A = ASPECTS.find(x => x[0] === a), T = TIERS.find(x => x[0] === t);
+  return [r16(A[1] * T[1]), r16(A[2] * T[1])];
+};
+
+// ---------- state ----------
+const DEF = {
+  prompt: "", aspect: "3:4", tier: "Normal", width: 1088, height: 1408,
+  loras: [{ name: "Disabled", w: 100 }], steps: 8, cfg: 1, sampler: "euler", scheduler: "simple",
+  seed: Math.floor(Math.random() * 1e14), rand: true, unet: "", clip: "", vae: ""
+};
+let S = Object.assign({}, DEF);
+try { Object.assign(S, JSON.parse(localStorage.getItem("magmix_studio") || "{}")); } catch (e) {}
+const save = () => { try { localStorage.setItem("magmix_studio", JSON.stringify(S)); } catch (e) {} };
+let LISTS = { unet: [], clip: [], vae: [], lora: [], sampler: ["euler"], scheduler: ["simple"] };
+
+// ---------- helpers ----------
+const fillRange = (el) => {
+  const p = (el.value - el.min) / (el.max - el.min) * 100;
+  el.style.setProperty("--p", p + "%");
+};
+const opt = (sel, values, cur, pretty) => {
+  sel.innerHTML = "";
+  values.forEach(v => { const o = document.createElement("option"); o.value = v;
+    o.textContent = pretty ? v.replace(/\.(safetensors|ckpt|pt|bin)$/i, "").replace(/__/g, " / ") : v; sel.appendChild(o); });
+  if (values.includes(cur)) sel.value = cur;
+};
+const status = (msg, err) => { $("status").textContent = msg || ""; $("status").className = "status" + (err ? " err" : ""); };
+const banner = (msg) => { const b = $("banner"); b.style.display = msg ? "block" : "none"; b.textContent = msg || ""; };
+const comboOptions = (spec) => {
+  if (!spec) return [];
+  if (Array.isArray(spec[0])) return spec[0];
+  if (spec[0] === "COMBO" && spec[1] && Array.isArray(spec[1].options)) return spec[1].options;
+  return [];
+};
+const pick = (list, cur, hints) => {
+  if (list.includes(cur)) return cur;
+  for (const h of hints) { const f = list.find(x => x.toLowerCase().includes(h)); if (f) return f; }
+  return list[0] || "";
+};
+
+// ---------- Image Size ----------
+function renderSize() {
+  // preset dropdown
+  const sel = $("preset"); sel.innerHTML = "";
+  const cur = `${S.width}x${S.height}`;
+  let found = false;
+  TIERS.forEach(([t]) => ASPECTS.forEach(([a]) => {
+    const [w, h] = dims(a, t), o = document.createElement("option");
+    o.value = `${a}|${t}`; o.textContent = `${w}x${h}   ·  ${a}  ${t}`;
+    if (`${w}x${h}` === cur && a === S.aspect && t === S.tier) { o.selected = true; found = true; }
+    sel.appendChild(o);
+  }));
+  if (!found) { const o = document.createElement("option"); o.value = "custom"; o.textContent = `${cur}   ·  กำหนดเอง`; o.selected = true; sel.prepend(o); }
+  // aspect chips
+  const box = $("aspects"); box.innerHTML = "";
+  ASPECTS.forEach(([a, w, h]) => {
+    const c = document.createElement("div"), k = 34 / Math.max(w, h);
+    c.className = "chip" + (a === S.aspect ? " on" : "");
+    c.innerHTML = `<div class="box" style="width:${Math.round(w * k)}px;height:${Math.round(h * k)}px"></div><span>${a}</span>`;
+    c.onclick = () => { S.aspect = a; [S.width, S.height] = dims(a, S.tier || "Normal"); if (!S.tier) S.tier = "Normal"; save(); renderSize(); };
+    box.appendChild(c);
+  });
+  const on = box.querySelector(".chip.on"); if (on) on.scrollIntoView({ block: "nearest", inline: "center" });
+  // tiers
+  const seg = $("tiers"); seg.innerHTML = "";
+  TIERS.forEach(([t]) => {
+    const b = document.createElement("button"); b.textContent = t; b.className = t === S.tier ? "on" : "";
+    b.onclick = () => { S.tier = t; if (!S.aspect) S.aspect = "3:4"; [S.width, S.height] = dims(S.aspect, t); save(); renderSize(); };
+    seg.appendChild(b);
+  });
+  // sliders
+  $("w").value = S.width; $("h").value = S.height; fillRange($("w")); fillRange($("h"));
+  $("wv").textContent = Number(S.width).toLocaleString(); $("hv").textContent = Number(S.height).toLocaleString();
+}
+$("preset").onchange = (e) => {
+  if (e.target.value === "custom") return;
+  const [a, t] = e.target.value.split("|"); S.aspect = a; S.tier = t; [S.width, S.height] = dims(a, t); save(); renderSize();
+};
+["w", "h"].forEach(id => $(id).addEventListener("input", (e) => {
+  S[id === "w" ? "width" : "height"] = Number(e.target.value);
+  const match = TIERS.flatMap(([t]) => ASPECTS.map(([a]) => [a, t])).find(([a, t]) => { const [w, h] = dims(a, t); return w === S.width && h === S.height; });
+  if (match) { S.aspect = match[0]; S.tier = match[1]; } else { S.aspect = ""; S.tier = ""; }
+  save(); renderSize();
+}));
+
+// ---------- LoRA ----------
+function renderLoras() {
+  const card = $("loraCard"); card.innerHTML = "";
+  S.loras.forEach((L, i) => {
+    if (L.name !== "Disabled" && LISTS.lora.length && !LISTS.lora.includes(L.name)) L.name = "Disabled";
+    const d = document.createElement("div"); d.className = "lora";
+    const btn = i === 0 ? `<button class="iconbtn" data-act="add" title="เพิ่มช่อง LoRA">+</button>`
+                        : `<button class="iconbtn" data-act="del" title="ลบช่องนี้">−</button>`;
+    d.innerHTML = `<div class="lora-head"><span>LoRA ${i + 1}</span>${btn}</div><select></select>
+      <div class="wrap" style="display:${L.name === "Disabled" ? "none" : "block"}">
+        <div class="row"><span>Weight</span><b>${Math.round(L.w)}%</b></div>
+        <input type="range" min="0" max="200" step="5" value="${L.w}"></div>`;
+    const sel = d.querySelector("select");
+    opt(sel, ["Disabled"].concat(LISTS.lora), L.name, true);
+    sel.onchange = () => { L.name = sel.value; save(); renderLoras(); };
+    const rg = d.querySelector("input[type=range]"); fillRange(rg);
+    rg.oninput = () => { L.w = Number(rg.value); d.querySelector(".row b").textContent = L.w + "%"; fillRange(rg); save(); };
+    d.querySelector("button").onclick = (e) => {
+      if (e.currentTarget.dataset.act === "add") { if (S.loras.length < MAX_LORA) S.loras.push({ name: "Disabled", w: 100 }); }
+      else S.loras.splice(i, 1);
+      save(); renderLoras();
+    };
+    card.appendChild(d);
+  });
+  if (!LISTS.lora.length) {
+    const p = document.createElement("div"); p.className = "muted"; p.style.marginTop = "10px";
+    p.textContent = "ยังไม่พบไฟล์ LoRA ในเครื่อง (ComfyUI/models/loras)"; card.appendChild(p);
+  }
+}
+
+// ---------- sampler / models ----------
+function renderSampler() {
+  $("steps").value = S.steps; $("stv").textContent = S.steps; fillRange($("steps"));
+  $("cfg").value = S.cfg; $("cfv").textContent = Number(S.cfg).toFixed(1); fillRange($("cfg"));
+  opt($("sampler"), LISTS.sampler, S.sampler); opt($("scheduler"), LISTS.scheduler, S.scheduler);
+  $("seed").value = S.seed; $("rand").checked = !!S.rand;
+  opt($("unet"), LISTS.unet, S.unet); opt($("clip"), LISTS.clip, S.clip); opt($("vae"), LISTS.vae, S.vae);
+}
+$("steps").oninput = (e) => { S.steps = Number(e.target.value); $("stv").textContent = S.steps; fillRange(e.target); save(); };
+$("cfg").oninput = (e) => { S.cfg = Number(e.target.value); $("cfv").textContent = S.cfg.toFixed(1); fillRange(e.target); save(); };
+["sampler", "scheduler", "unet", "clip", "vae"].forEach(k => $(k).onchange = (e) => { S[k] = e.target.value; save(); });
+$("seed").onchange = (e) => { S.seed = Math.max(0, Math.floor(Number(e.target.value) || 0)); save(); };
+$("dice").onclick = () => { S.seed = Math.floor(Math.random() * 1e14); $("seed").value = S.seed; save(); };
+$("rand").onchange = (e) => { S.rand = e.target.checked; save(); };
+$("prompt").value = S.prompt || "";
+$("prompt").oninput = (e) => { S.prompt = e.target.value; save(); };
+
+// ---------- load lists from ComfyUI ----------
+async function info(node) {
+  const r = await fetch(`${API}/object_info/${node}`);
+  if (!r.ok) throw new Error(`object_info ${node}: HTTP ${r.status}`);
+  const j = await r.json(); return (j[node] && j[node].input && j[node].input.required) || {};
+}
+async function loadLists() {
+  try {
+    const [u, c, v, l, k] = await Promise.all(["UNETLoader", "CLIPLoader", "VAELoader", "LoraLoaderModelOnly", "KSampler"].map(info));
+    LISTS.unet = comboOptions(u.unet_name); LISTS.clip = comboOptions(c.clip_name); LISTS.vae = comboOptions(v.vae_name);
+    LISTS.lora = comboOptions(l.lora_name); LISTS.sampler = comboOptions(k.sampler_name); LISTS.scheduler = comboOptions(k.scheduler);
+    LISTS.clipTypes = comboOptions(c.type);
+    S.unet = pick(LISTS.unet, S.unet, ["krea2_turbo", "krea2"]);
+    S.clip = pick(LISTS.clip, S.clip, ["qwen3vl_4b", "qwen3vl"]);
+    S.vae = pick(LISTS.vae, S.vae, ["qwen_image_vae", "qwen"]);
+    S.sampler = pick(LISTS.sampler, S.sampler, ["euler"]); S.scheduler = pick(LISTS.scheduler, S.scheduler, ["simple"]);
+    const miss = [];
+    if (!LISTS.unet.length) miss.push("diffusion model"); if (!LISTS.clip.length) miss.push("text encoder"); if (!LISTS.vae.length) miss.push("VAE");
+    if (LISTS.clipTypes.length && !LISTS.clipTypes.includes("krea2")) miss.push("ComfyUI รุ่นนี้ยังไม่รองรับ Krea 2 (อัปเดต ComfyUI)");
+    banner(miss.length ? "⚠️ ยังขาด: " + miss.join(", ") : "");
+    save();
+  } catch (e) {
+    banner("⚠️ ต่อ ComfyUI ไม่ได้ — เปิดหน้านี้จากเครื่อง vast (…/magmix) และรอ ComfyUI เปิดเสร็จก่อน\n" + e.message);
+  }
+  renderLoras(); renderSampler();
+}
+
+// ---------- build ComfyUI API prompt ----------
+function buildPrompt(seed) {
+  const P = {
+    "10": { class_type: "UNETLoader", inputs: { unet_name: S.unet, weight_dtype: "default" } },
+    "11": { class_type: "CLIPLoader", inputs: { clip_name: S.clip, type: "krea2", device: "default" } },
+    "12": { class_type: "VAELoader", inputs: { vae_name: S.vae } }
+  };
+  let model = ["10", 0];
+  S.loras.filter(L => L.name !== "Disabled" && L.w > 0).forEach((L, i) => {
+    const id = String(30 + i);
+    P[id] = { class_type: "LoraLoaderModelOnly", inputs: { model, lora_name: L.name, strength_model: L.w / 100 } };
+    model = [id, 0];
+  });
+  P["13"] = { class_type: "CLIPTextEncode", inputs: { text: S.prompt || "", clip: ["11", 0] } };
+  P["14"] = { class_type: "ConditioningZeroOut", inputs: { conditioning: ["13", 0] } };
+  P["15"] = { class_type: "EmptyLatentImage", inputs: { width: S.width, height: S.height, batch_size: 1 } };
+  P["16"] = { class_type: "KSampler", inputs: { seed, steps: S.steps, cfg: S.cfg, sampler_name: S.sampler, scheduler: S.scheduler,
+                denoise: 1, model, positive: ["13", 0], negative: ["14", 0], latent_image: ["15", 0] } };
+  P["17"] = { class_type: "VAEDecode", inputs: { samples: ["16", 0], vae: ["12", 0] } };
+  P["18"] = { class_type: "SaveImage", inputs: { filename_prefix: "MagMix", images: ["17", 0] } };
+  return P;
+}
+
+// ---------- image helpers ----------
+const viewUrl = (im) => `${API}/view?filename=${encodeURIComponent(im.filename)}&subfolder=${encodeURIComponent(im.subfolder || "")}&type=${encodeURIComponent(im.type || "output")}`;
+let current = null;
+function show(im, meta) {
+  current = im;
+  const url = viewUrl(im);
+  $("stage").innerHTML = `<img src="${url}" alt=""><div class="tools"><a href="${url}" target="_blank" rel="noopener">เปิดเต็ม</a><a href="${url}" download="${im.filename}">ดาวน์โหลด</a></div>`;
+  $("meta").textContent = meta || im.filename;
+  document.querySelectorAll(".grid .cell").forEach(c => c.classList.toggle("on", c.dataset.f === im.filename));
+}
+function showPreview(blobUrl) {
+  const img = $("stage").querySelector("img.preview");
+  if (img) { const old = img.src; img.src = blobUrl; URL.revokeObjectURL(old); }
+  else $("stage").innerHTML = `<img class="preview" src="${blobUrl}" alt="">`;
+}
+
+// ---------- gallery (12 ภาพล่าสุดจาก history ของ ComfyUI) ----------
+async function loadGallery() {
+  try {
+    const r = await fetch(`${API}/history?max_items=200`);
+    const H = await r.json();
+    const items = []; let k = 0;
+    Object.values(H).forEach(h => {
+      const ts = (h.status && h.status.messages || []).map(m => m[1] && m[1].timestamp).filter(Boolean)[0] || 0;
+      Object.values(h.outputs || {}).forEach(o => (o.images || []).forEach(im => { if (im.type === "output") items.push({ im, ts, k: k++ }); }));
+    });
+    items.sort((a, b) => (b.ts - a.ts) || (b.k - a.k));
+    const last = items.slice(0, 12);
+    const g = $("grid"); g.innerHTML = "";
+    last.forEach(({ im }) => {
+      const c = document.createElement("div"); c.className = "cell"; c.dataset.f = im.filename;
+      c.innerHTML = `<img loading="lazy" src="${viewUrl(im)}" alt="">`;
+      c.onclick = () => show(im); g.appendChild(c);
+    });
+    for (let i = last.length; i < 12; i++) { const p = document.createElement("div"); p.className = "ph"; g.appendChild(p); }
+    $("gcount").textContent = last.length ? `${last.length}/12` : "";
+    if (current) show(current, $("meta").textContent);
+    return last;
+  } catch (e) { return []; }
+}
+
+// ---------- websocket (progress + live preview) ----------
+let ws = null, wsOk = false, running = null;
+function connectWS() {
+  try {
+    ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws?clientId=${CLIENT_ID}`);
+    ws.binaryType = "blob";
+    ws.onopen = () => { wsOk = true; };
+    ws.onclose = () => { wsOk = false; setTimeout(connectWS, 3000); };
+    ws.onmessage = (ev) => {
+      if (typeof ev.data !== "string") {             // binary = latent preview
+        if (running) showPreview(URL.createObjectURL(ev.data.slice(8, ev.data.size, "image/jpeg")));
+        return;
+      }
+      let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      const d = m.data || {};
+      if (!running || (d.prompt_id && d.prompt_id !== running.id)) return;
+      if (m.type === "progress") {
+        $("bar").style.width = (d.value / d.max * 100) + "%";
+        status(`กำลังสร้าง… ${d.value}/${d.max}`);
+      } else if (m.type === "executing" && d.node) {
+        status({ "10": "โหลดโมเดล…", "11": "โหลด text encoder…", "12": "โหลด VAE…", "13": "อ่าน prompt…", "17": "แปลงเป็นภาพ…" }[d.node] || (Number(d.node) >= 30 && Number(d.node) < 40 ? "โหลด LoRA…" : $("status").textContent));
+      } else if (m.type === "executed" && d.node === "18" && d.output && d.output.images) {
+        finish(d.output.images[0]);
+      } else if (m.type === "execution_error") {
+        fail(`❌ ${d.node_type || ""}: ${d.exception_message || "เกิดข้อผิดพลาด"}`);
+      } else if (m.type === "execution_cached" && (d.nodes || []).includes("18")) {
+        poll(running.id);
+      }
+    };
+  } catch (e) { wsOk = false; }
+}
+
+function finish(im) {
+  if (!running) return;
+  const sec = ((Date.now() - running.t0) / 1000).toFixed(1);
+  const meta = `${S.width}×${S.height} · seed ${running.seed} · ${sec}s`;
+  running = null; $("go").disabled = false; $("bar").style.width = "100%";
+  status(`✅ เสร็จใน ${sec} วินาที`);
+  show(im, meta); loadGallery();
+}
+function fail(msg) { running = null; $("go").disabled = false; $("bar").style.width = "0"; status(msg, true); }
+
+async function poll(id) {      // สำรองเผื่อ websocket ไม่ทำงาน
+  for (let i = 0; i < 900 && running && running.id === id; i++) {
+    try {
+      const r = await fetch(`${API}/history/${id}`); const j = await r.json(); const h = j[id];
+      if (h) {
+        const st = h.status || {};
+        if (st.status_str === "error") {
+          const em = (st.messages || []).find(x => x[0] === "execution_error");
+          return fail("❌ " + (em ? `${em[1].node_type}: ${em[1].exception_message}` : "เกิดข้อผิดพลาด"));
+        }
+        const out = h.outputs && h.outputs["18"];
+        if (out && out.images && out.images.length) return finish(out.images[0]);
+      }
+    } catch (e) {}
+    await new Promise(r => setTimeout(r, wsOk ? 4000 : 1500));
+  }
+}
+
+async function generate() {
+  if (running) return;
+  if (!S.unet || !S.clip || !S.vae) { status("ยังโหลดรายชื่อโมเดลไม่ได้ — ตรวจว่า ComfyUI เปิดอยู่", true); return; }
+  if (S.rand) { S.seed = Math.floor(Math.random() * 1e14); $("seed").value = S.seed; save(); }
+  const seed = S.seed;
+  $("go").disabled = true; $("bar").style.width = "0"; status("ส่งงาน…");
+  try {
+    const r = await fetch(`${API}/prompt`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: buildPrompt(seed), client_id: CLIENT_ID }) });
+    const j = await r.json();
+    if (!r.ok || j.error) {
+      const ne = j.node_errors ? Object.values(j.node_errors).map(n => `${n.class_type}: ${(n.errors || []).map(e => e.details || e.message).join(", ")}`).join("\n") : "";
+      return fail("❌ " + ((j.error && (j.error.message || j.error)) || `HTTP ${r.status}`) + (ne ? "\n" + ne : ""));
+    }
+    running = { id: j.prompt_id, seed, t0: Date.now() };
+    status(j.number ? `เข้าคิวแล้ว (ลำดับ ${j.number})` : "เข้าคิวแล้ว");
+    poll(j.prompt_id);
+  } catch (e) { fail("❌ ส่งงานไม่สำเร็จ: " + e.message); }
+}
+$("go").onclick = generate;
+$("prompt").addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") generate(); });
+
+// ---------- start ----------
+renderSize(); renderLoras(); renderSampler();
+connectWS(); loadLists();
+loadGallery().then(last => { if (last.length) show(last[0].im); });
+})();
+</script>
+</body>
+</html>
+'''
+
+
+async def _magmix_page(request):
+    return web.Response(text=HTML, content_type="text/html", charset="utf-8",
+                        headers={"Cache-Control": "no-store"})
+
+PromptServer.instance.routes.get("/magmix")(_magmix_page)
+PromptServer.instance.routes.get("/magmix/")(_magmix_page)
+
+NODE_CLASS_MAPPINGS = {}
+NODE_DISPLAY_NAME_MAPPINGS = {}
+print("[MagMix Studio] พร้อมใช้งาน → เปิด /magmix")
+MAGMIX_PLUGIN_EOF
+echo "✓ ติดตั้งหน้าแอป MagMix Studio แล้ว"
+
+# ---------- รีสตาร์ต ComfyUI ให้โหลดหน้าแอป ----------
+supervisorctl restart comfyui || true
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "⚠️ บางไฟล์โหลดไม่สำเร็จ — vast จะลองใหม่ตอนรีสตาร์ตเครื่อง"
+  exit 1
+fi
+echo "✅ MagMix พร้อมใช้งาน — เปิด ComfyUI แล้วเติม /magmix ต่อท้ายที่อยู่"
